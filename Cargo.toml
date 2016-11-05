@@ -1,0 +1,10 @@
+[package]
+name = "futures-mpsc"
+version = "0.1.0"
+authors = ["Carl Lerche <me@carllerche.com>"]
+
+[dependencies]
+futures = "0.1"
+
+[replace]
+"futures:0.1.3" = { git = "https://github.com/alexcrichton/futures-rs" }

@@ -11,20 +11,18 @@
 extern crate futures;
 
 mod mpsc_queue;
-mod spin;
 
 use mpsc_queue::{Queue, PopResult};
-use spin::Mutex;
 
 use futures::{Async, AsyncSink, Poll, StartSend};
 use futures::task::{self, Task};
 use futures::sink::{Sink};
 use futures::stream::Stream;
 
-use std::usize;
-use std::cell::{Cell, UnsafeCell};
+use std::{thread, usize};
+use std::cell::Cell;
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub use std::sync::mpsc::SendError;
@@ -36,7 +34,7 @@ pub struct Sender<T> {
     // Handle to the task that is blocked on this sender. This handle is sent
     // to the receiver half in order to be notified when the sender becomes
     // unblocked.
-    task: TaskHandle,
+    sender_task: SenderTask,
 
     // True if the sender might be blocked. This is an optimization to avoid
     // having to lock the mutex most of the time.
@@ -65,13 +63,13 @@ struct Inner<T> {
     message_queue: Queue<Option<T>>,
 
     // Wait queue
-    wait_queue: Queue<TaskHandle>,
+    wait_queue: Queue<SenderTask>,
 
     // Number of senders
     num_senders: AtomicUsize,
 
     // Handle to the receiver's task.
-    recv_task: UnsafeCell<Option<Task>>,
+    recv_task: Mutex<Option<Task>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -97,7 +95,7 @@ const INIT_STATE: usize = OPEN_MASK;
 const MAX_BUFFER: usize = !(RECV_PARKED_MASK | OPEN_MASK);
 
 // Sent to the consumer to wake up blocked producers
-type TaskHandle = Arc<Mutex<Option<Task>>>;
+type SenderTask = Arc<Mutex<Option<Task>>>;
 
 /// Create a new channel pair
 pub fn channel<T>(buffer: usize) -> (Sender<T>, Receiver<T>) {
@@ -119,12 +117,12 @@ fn channel2<T>(buffer: Option<usize>) -> (Sender<T>, Receiver<T>) {
         message_queue: Queue::new(),
         wait_queue: Queue::new(),
         num_senders: AtomicUsize::new(1),
-        recv_task: UnsafeCell::new(None),
+        recv_task: Mutex::new(None),
     });
 
     let tx = Sender {
         inner: inner.clone(),
-        task: Arc::new(Mutex::new(None)),
+        sender_task: Arc::new(Mutex::new(None)),
         maybe_parked: Cell::new(false),
     };
 
@@ -170,7 +168,7 @@ impl<T> Sender<T> {
             if actual == curr {
                 return Some(Sender {
                     inner: self.inner.clone(),
-                    task: Arc::new(Mutex::new(None)),
+                    sender_task: Arc::new(Mutex::new(None)),
                     maybe_parked: Cell::new(false),
                 });
             }
@@ -183,8 +181,10 @@ impl<T> Sender<T> {
         // First check the `maybe_parked` variable. This avoids acquiring the
         // lock in most cases
         if self.maybe_parked.get() {
-            // The 
-            if self.task.lock().is_some() {
+            // Get a lock on the task handle
+            let task = self.sender_task.lock().unwrap();
+
+            if task.is_some() {
                 Async::NotReady
             } else {
                 self.maybe_parked.set(false);
@@ -195,6 +195,7 @@ impl<T> Sender<T> {
         }
     }
 
+    // Does the actual sending work
     fn start_send2(&self, msg: T) -> StartSend<T, SendError<T>> {
         // If the sender is currently blocked, reject the message
         if !self.poll_ready().is_ready() {
@@ -228,9 +229,9 @@ impl<T> Sender<T> {
         self.inner.message_queue.push(msg);
 
         if unpark_recv {
-            let task = unsafe { &*self.inner.recv_task.get() };
+            let mut task = self.inner.recv_task.lock().unwrap();
 
-            if let &Some(ref task) = task {
+            if let Some(task) = task.take() {
                 task.unpark();
             }
         }
@@ -241,11 +242,12 @@ impl<T> Sender<T> {
     // Increment the number of queued messages. Returns if the sender should
     // block.
     fn inc_num_messages(&self) -> Option<(bool, bool)> {
-        let mut curr = self.inner.state.load(Ordering::Acquire);
+        let mut curr = self.inner.state.load(Ordering::SeqCst);
 
         loop {
             let mut state = decode_state(curr);
 
+            // The receiver end closed the channel.
             if !state.is_open {
                 return None;
             }
@@ -255,7 +257,7 @@ impl<T> Sender<T> {
             state.num_messages += 1;
 
             let next = encode_state(&state);
-            let actual = self.inner.state.compare_and_swap(curr, next, Ordering::Release);
+            let actual = self.inner.state.compare_and_swap(curr, next, Ordering::SeqCst);
 
             if curr == actual {
                 // Block if the current length is greater than the buffer
@@ -265,7 +267,7 @@ impl<T> Sender<T> {
                 };
 
                 // Only unpark the receive half if transitioning from 0 -> 1.
-                let unpark_recv = state.num_messages == 1 && state.recv_parked;
+                let unpark_recv = state.num_messages == 1;
 
                 return Some((park_self, unpark_recv));
             }
@@ -284,10 +286,10 @@ impl<T> Sender<T> {
         };
 
         self.maybe_parked.set(true);
-        *self.task.lock() = task;
+        *self.sender_task.lock().unwrap() = task;
 
         // Send handle over queue
-        let t = self.task.clone();
+        let t = self.sender_task.clone();
         self.inner.wait_queue.push(t);
     }
 }
@@ -374,37 +376,28 @@ impl<T> Receiver<T> {
         }
     }
 
-    fn next_message(&self) -> Option<T> {
+    fn next_message(&self) -> Async<Option<T>> {
         // Pop off a message
         loop {
             match unsafe { self.inner.message_queue.pop() } {
                 PopResult::Data(msg) => {
-                    return msg;
+                    return Async::Ready(msg);
                 }
-                _ => {
-                    // Both Empty & Inconsistent mean that there will be a
-                    // message to pop in a short time. This branch can only be
-                    // reached if values are being produced from another
-                    // thread, so there are a few ways that we can deal with
-                    // this:
+                PopResult::Empty => {
+                    return Async::NotReady;
+                }
+                PopResult::Inconsistent => {
+                    // Inconsistent means that there will be a message to pop
+                    // in a short time. This branch can only be reached if
+                    // values are being produced from another thread, so there
+                    // are a few ways that we can deal with this:
                     //
                     // 1) Spin
                     // 2) thread::yield_now()
                     // 3) task::park().unwrap() & return NotReady
+                    thread::yield_now();
                 }
             }
-        }
-    }
-
-    // `num_messages` represents the number of pending messages before
-    // decrementing
-    fn maybe_unpark_one(&self, num_messages: usize) {
-        // There are waiters, pop one off the queue and wake it up
-        match self.inner.buffer {
-            Some(buffer) if num_messages > buffer => {
-                self.unpark_one();
-            }
-            _ => {}
         }
     }
 
@@ -412,105 +405,57 @@ impl<T> Receiver<T> {
         loop {
             match unsafe { self.inner.wait_queue.pop() } {
                 PopResult::Data(task) => {
-                    if let Some(task) = task.lock().take() {
+                    if let Some(task) = task.lock().unwrap().take() {
                         task.unpark();
                     }
 
                     return;
                 }
-                _ => {
+                PopResult::Empty => {
+                    return;
+                }
+                PopResult::Inconsistent => {
                     // Same as above
+                    thread::yield_now();
                 }
             }
         }
     }
 
-    fn try_park(&self, mut curr: usize) -> usize {
-        let task_is_current = unsafe {
-            (*self.inner.recv_task.get()).as_ref()
-                .map(|t| t.is_current())
-                .unwrap_or(false)
-        };
+    fn try_park(&self) -> bool {
+        let curr = self.inner.state.load(Ordering::SeqCst);
+        let state = decode_state(curr);
 
-        if  !task_is_current {
-            // recv_task is not correct and needs to be changed. Since this
-            // value is accessed concurrently on the send side, some
-            // coordination is needed to updated.
-            //
-            // The following steps may seem convoluted, but are necessary to
-            // keep the channel state correct.
-            //
-            // First, swap num_messages from 0 -> 1, doing so effectively
-            // obtains a lock on `recv_task` as the sender half only accesses
-            // `recv_task` when it makes the 0 -> 1 transition.
-
-            let mut next_state = decode_state(curr);
-            next_state.num_messages = 1;
-            next_state.recv_parked = false;
-            let next = encode_state(&next_state);
-
-            let actual = self.inner.state.compare_and_swap(curr, next, Ordering::Release);
-            let state = decode_state(actual);
-
-            if curr != actual {
-                // The lock was not obtained, but this also means that a
-                // message has been sent, so `recv_task` doesn't need to be
-                // updated.
-                assert!(state.num_messages > 0);
-                return state.num_messages;
-            }
-
-            // The lock has been acquired and `recv_task` can safely be updated
-            unsafe { *self.inner.recv_task.get() = Some(task::park()) };
-
-            let num_messages_after = self.dec_num_messages(next, true);
-
-            // If the previous value got bumped above buffer, then we need to
-            // unpark a waiting sender
-            if num_messages_after != state.num_messages {
-                self.maybe_unpark_one(num_messages_after + 1);
-            }
-
-            state.num_messages
-        } else {
-            loop {
-                let mut state = decode_state(curr);
-
-                if state.num_messages > 0 {
-                    return state.num_messages;
-                }
-
-                if state.recv_parked {
-                    // recv blocked flag already set, nothing more to do
-                    return 0;
-                }
-
-                state.recv_parked = true;
-
-                let next = encode_state(&state);
-                let actual = self.inner.state.compare_and_swap(curr, next, Ordering::Release);
-
-                if curr == actual {
-                    return 0;
-                }
-
-                curr = actual;
-            }
+        if state.num_messages > 0 {
+            return false;
         }
+
+        // First, track the task
+        let mut task = self.inner.recv_task.lock().unwrap();
+        *task = Some(task::park());
+
+        // Ensure that there are still no messages
+        let curr = self.inner.state.load(Ordering::SeqCst);
+        let state = decode_state(curr);
+
+        state.num_messages == 0
     }
 
-    fn dec_num_messages(&self, mut curr: usize, park: bool) -> usize {
+    fn dec_num_messages(&self) {
+        // No memory is being acquired as part of this step. Release is used to
+        // ensure that the queue reads happen before decrementing the counter.
+        let mut curr = self.inner.state.load(Ordering::SeqCst);
+
         loop {
             let mut state = decode_state(curr);
 
             state.num_messages -= 1;
-            state.recv_parked = park && state.num_messages == 0;
 
             let next = encode_state(&state);
-            let actual = self.inner.state.compare_and_swap(curr, next, Ordering::Release);
+            let actual = self.inner.state.compare_and_swap(curr, next, Ordering::SeqCst);
 
             if actual == curr {
-                return state.num_messages;
+                return;
             }
 
             curr = actual;
@@ -523,36 +468,35 @@ impl<T> Stream for Receiver<T> {
     type Error = ();
 
     fn poll(&mut self) -> Poll<Option<T>, ()> {
+        // If `None` has previously been seen, then always return `None`
         if self.received_last_msg {
             return Ok(Async::Ready(None));
         }
 
-        let curr = self.inner.state.load(Ordering::Acquire);
-        let mut state = decode_state(curr);
+        loop {
+            let msg = match self.next_message() {
+                Async::Ready(msg) => msg,
+                Async::NotReady => {
+                    if self.try_park() {
+                        return Ok(Async::NotReady);
+                    }
 
-        if state.num_messages == 0 {
-            state.num_messages = self.try_park(curr);
+                    // A message should arrive shortly
+                    thread::yield_now();
+                    continue;
+                }
+            };
 
-            if state.num_messages == 0 {
-                return Ok(Async::NotReady);
-            }
+            // Unpark a send waiter
+            self.unpark_one();
+
+            // Decrement number of messages
+            self.dec_num_messages();
+
+            self.received_last_msg = msg.is_none();
+
+            return Ok(Async::Ready(msg));
         }
-
-        // Pop off a message
-        let msg = self.next_message();
-        self.received_last_msg = msg.is_none();
-
-        // Unpark a send waiter if needed
-        self.maybe_unpark_one(state.num_messages);
-
-        // Try to compute the most up to date probable value
-        let curr = encode_state(&state);
-
-        // Decrement the number of pending messages and unset the receiver
-        // blocked flag
-        self.dec_num_messages(curr, false);
-
-        Ok(Async::Ready(msg))
     }
 }
 

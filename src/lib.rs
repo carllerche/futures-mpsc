@@ -85,9 +85,9 @@ const OPEN_MASK: usize = 1 << 31;
 
 const INIT_STATE: usize = OPEN_MASK;
 
-// The absolute maximum buffer size of the channel. This is due to the fact
-// that the `messages` usize value must also track the wait flag.
-const MAX_BUFFER: usize = !(OPEN_MASK);
+const MAX_CAPACITY: usize = !(OPEN_MASK);
+
+const MAX_BUFFER: usize = MAX_CAPACITY >> 1;
 
 // Sent to the consumer to wake up blocked producers
 type SenderTask = Arc<Mutex<Option<Task>>>;
@@ -140,7 +140,7 @@ impl<T> Sender<T> {
     /// This function will succeed if doing so will not cause the total number
     /// of outstanding senders to exceed the maximum that can be handled by the
     /// system.
-    pub fn try_clone(&self) -> Option<Sender<T>> {
+    fn try_clone(&self) -> Option<Sender<T>> {
         // Since this atomic op isn't actually guarding any memory and we don't
         // care about any orderings besides the ordering on the single atomic
         // variable, a relaxed ordering is acceptable.
@@ -247,7 +247,7 @@ impl<T> Sender<T> {
                 return None;
             }
 
-            assert!(state.num_messages < MAX_BUFFER, "buffer space exhausted; sending this messages would overflow the state");
+            assert!(state.num_messages < MAX_CAPACITY, "buffer space exhausted; sending this messages would overflow the state");
 
             state.num_messages += 1;
 
@@ -517,13 +517,11 @@ impl<T> Stream for Receiver<T> {
 
 impl<T> Inner<T> {
     // The return value is such that the total number of messages that can be
-    // enqueued into the channel will never exceed MAX_BUFFER
-    //
-    // if `buffer == usize::MAX` is a special case
+    // enqueued into the channel will never exceed MAX_CAPACITY
     fn max_senders(&self) -> usize {
         match self.buffer {
-            Some(buffer) => MAX_BUFFER - buffer,
-            None => usize::MAX,
+            Some(buffer) => MAX_CAPACITY - buffer,
+            None => MAX_BUFFER,
         }
     }
 }
@@ -540,7 +538,7 @@ unsafe impl<T: Send> Sync for Inner<T> {}
 fn decode_state(num: usize) -> State {
     State {
         is_open: num & OPEN_MASK == OPEN_MASK,
-        num_messages: num & MAX_BUFFER,
+        num_messages: num & MAX_CAPACITY,
     }
 }
 

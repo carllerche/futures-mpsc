@@ -74,9 +74,6 @@ struct Inner<T> {
 
 #[derive(Debug, Clone, Copy)]
 struct State {
-    // The `Receive` half of the channel is parked
-    recv_parked: bool,
-
     // `true` when the channel is open
     is_open: bool,
 
@@ -84,15 +81,13 @@ struct State {
     num_messages: usize,
 }
 
-const RECV_PARKED_MASK: usize = 1 << 31;
-
-const OPEN_MASK: usize = 1 << 30;
+const OPEN_MASK: usize = 1 << 31;
 
 const INIT_STATE: usize = OPEN_MASK;
 
 // The absolute maximum buffer size of the channel. This is due to the fact
 // that the `messages` usize value must also track the wait flag.
-const MAX_BUFFER: usize = !(RECV_PARKED_MASK | OPEN_MASK);
+const MAX_BUFFER: usize = !(OPEN_MASK);
 
 // Sent to the consumer to wake up blocked producers
 type SenderTask = Arc<Mutex<Option<Task>>>;
@@ -536,7 +531,6 @@ unsafe impl<T: Send> Sync for Inner<T> {}
 
 fn decode_state(num: usize) -> State {
     State {
-        recv_parked: num & RECV_PARKED_MASK == RECV_PARKED_MASK,
         is_open: num & OPEN_MASK == OPEN_MASK,
         num_messages: num & MAX_BUFFER,
     }
@@ -544,10 +538,6 @@ fn decode_state(num: usize) -> State {
 
 fn encode_state(state: &State) -> usize {
     let mut num = state.num_messages;
-
-    if state.recv_parked {
-        num |= RECV_PARKED_MASK;
-    }
 
     if state.is_open {
         num |= OPEN_MASK;

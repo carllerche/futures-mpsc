@@ -229,9 +229,11 @@ impl<T> Sender<T> {
         self.inner.message_queue.push(msg);
 
         if unpark_recv {
-            let mut task = self.inner.recv_task.lock().unwrap();
+            // Do this step first so that the lock is dropped when
+            // `unpark` is called
+            let task = self.inner.recv_task.lock().unwrap().take();
 
-            if let Some(task) = task.take() {
+            if let Some(task) = task {
                 task.unpark();
             }
         }
@@ -405,7 +407,11 @@ impl<T> Receiver<T> {
         loop {
             match unsafe { self.inner.wait_queue.pop() } {
                 PopResult::Data(task) => {
-                    if let Some(task) = task.lock().unwrap().take() {
+                    // Do this step first so that the lock is dropped when
+                    // `unpark` is called
+                    let task = task.lock().unwrap().take();
+
+                    if let Some(task) = task {
                         task.unpark();
                     }
 

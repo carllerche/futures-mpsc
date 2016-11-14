@@ -105,6 +105,36 @@ fn send_recv_threads_no_capacity() {
 }
 
 #[test]
+fn recv_close_gets_none() {
+    let (tx, mut rx) = mpsc::channel::<i32>(10);
+
+    // Run on a task context
+    lazy(move || {
+        rx.close();
+
+        assert_eq!(rx.poll(), Ok(Async::Ready(None)));
+
+        drop(tx);
+
+        Ok::<(), ()>(())
+    }).wait().unwrap();
+}
+
+
+#[test]
+fn tx_close_gets_none() {
+    let (_, mut rx) = mpsc::channel::<i32>(10);
+
+    // Run on a task context
+    lazy(move || {
+        assert_eq!(rx.poll(), Ok(Async::Ready(None)));
+        assert_eq!(rx.poll(), Ok(Async::Ready(None)));
+
+        Ok::<(), ()>(())
+    }).wait().unwrap();
+}
+
+#[test]
 fn stress_shared_unbounded() {
     const AMT: u32 = 10000;
     const NTHREADS: u32 = 8;

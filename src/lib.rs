@@ -21,7 +21,6 @@ use futures::stream::Stream;
 
 use std::{thread, usize};
 use std::cell::Cell;
-use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -45,11 +44,6 @@ pub struct Sender<T> {
 
 pub struct Receiver<T> {
     inner: Arc<Inner<T>>,
-
-    received_last_msg: bool,
-
-    // Prevent `Receiver` from being `Sync`
-    no_sync: PhantomData<Cell<()>>,
 }
 
 struct Inner<T> {
@@ -79,6 +73,12 @@ struct State {
 
     // Number of messages in the channel
     num_messages: usize,
+}
+
+enum TryPark {
+    Parked,
+    Closed,
+    NotEmpty,
 }
 
 const OPEN_MASK: usize = 1 << 31;
@@ -123,8 +123,6 @@ fn channel2<T>(buffer: Option<usize>) -> (Sender<T>, Receiver<T>) {
 
     let rx = Receiver {
         inner: inner,
-        received_last_msg: false,
-        no_sync: PhantomData,
     };
 
     (tx, rx)
@@ -204,7 +202,7 @@ impl<T> Sender<T> {
 
     // Do the send without failing
     fn do_send(&self, msg: Option<T>, can_park: bool) -> Result<(), SendError<T>> {
-        let (park_self, unpark_recv) = match self.inc_num_messages() {
+        let (park_self, unpark_recv) = match self.inc_num_messages(msg.is_none()) {
             Some((park_self, unpark_recv)) => (park_self, unpark_recv),
             None => {
                 // The receiver has closed the channel
@@ -238,7 +236,7 @@ impl<T> Sender<T> {
 
     // Increment the number of queued messages. Returns if the sender should
     // block.
-    fn inc_num_messages(&self) -> Option<(bool, bool)> {
+    fn inc_num_messages(&self, close: bool) -> Option<(bool, bool)> {
         let mut curr = self.inner.state.load(Ordering::SeqCst);
 
         loop {
@@ -252,6 +250,10 @@ impl<T> Sender<T> {
             assert!(state.num_messages < MAX_BUFFER, "buffer space exhausted; sending this messages would overflow the state");
 
             state.num_messages += 1;
+
+            if close {
+                state.is_open = false;
+            }
 
             let next = encode_state(&state);
             let actual = self.inner.state.compare_and_swap(curr, next, Ordering::SeqCst);
@@ -345,7 +347,7 @@ impl<T> Receiver<T> {
     ///
     /// This prevents any further messages from being sent on the channel while
     /// still enabling the receiver to drain messages that are buffered.
-    pub fn close(&self) {
+    pub fn close(&mut self) {
         // A relaxed memory ordering is acceptable given that toggling the
         // flag is an isolated operation. If no further functions are
         // called on `Receiver` then the outcome of this function doesn't
@@ -423,12 +425,16 @@ impl<T> Receiver<T> {
         }
     }
 
-    fn try_park(&self) -> bool {
+    fn try_park(&self) -> TryPark {
         let curr = self.inner.state.load(Ordering::SeqCst);
         let state = decode_state(curr);
 
         if state.num_messages > 0 {
-            return false;
+            return TryPark::NotEmpty;
+        }
+
+        if !state.is_open {
+            return TryPark::Closed;
         }
 
         // First, track the task
@@ -439,7 +445,11 @@ impl<T> Receiver<T> {
         let curr = self.inner.state.load(Ordering::SeqCst);
         let state = decode_state(curr);
 
-        state.num_messages == 0
+        if state.num_messages == 0 {
+            TryPark::NotEmpty
+        } else {
+            TryPark::Parked
+        }
     }
 
     fn dec_num_messages(&self) {
@@ -469,22 +479,22 @@ impl<T> Stream for Receiver<T> {
     type Error = ();
 
     fn poll(&mut self) -> Poll<Option<T>, ()> {
-        // If `None` has previously been seen, then always return `None`
-        if self.received_last_msg {
-            return Ok(Async::Ready(None));
-        }
-
         loop {
             let msg = match self.next_message() {
                 Async::Ready(msg) => msg,
                 Async::NotReady => {
-                    if self.try_park() {
-                        return Ok(Async::NotReady);
+                    match self.try_park() {
+                        TryPark::Parked => {
+                            return Ok(Async::NotReady);
+                        }
+                        TryPark::Closed => {
+                            return Ok(Async::Ready(None));
+                        }
+                        TryPark::NotEmpty => {
+                            thread::yield_now();
+                            continue;
+                        }
                     }
-
-                    // A message should arrive shortly
-                    thread::yield_now();
-                    continue;
                 }
             };
 
@@ -493,8 +503,6 @@ impl<T> Stream for Receiver<T> {
 
             // Decrement number of messages
             self.dec_num_messages();
-
-            self.received_last_msg = msg.is_none();
 
             return Ok(Async::Ready(msg));
         }

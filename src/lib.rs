@@ -1,12 +1,31 @@
-/*
- * TODO:
- *
- * - Clean up code
- * - Document API
- * - Document concurrent algorithm
- * - Add `Sender::poll_cancel`
- *
- */
+//! A multi-producer, single-consumer, futures-aware, FIFO queue with back pressure.
+//!
+//! A channel can be used as a communication primitive between tasks running on
+//! `futures-rs` executors. Channel creation provides `Receiver` and `Sender`
+//! handles. `Receiver` implements `Stream` and allows a task to read values
+//! out of the channel. If there is no message to read from the channel, the
+//! curernt task will be notified when a new value is sent. `Sender` implements
+//! the `Sink` trait and allows a task to send messages into the channel. If
+//! the channel is at capacity, then send will be rejected and the task will be
+//! notified when additional capacity is available.
+//!
+//! # Disconnection
+//!
+//! When all `Sender` handles have been dropped, it is no longer possible to
+//! send values into the channel. This is considered the termination event of
+//! the stream. As such, `Sender::poll` will return `Ok(Ready(None))`.
+//!
+//! If the receiver handle is dropped, then messages can no longer be read out
+//! of the channel. In this case, a `send` will result in an error.
+//!
+//! # Clean Shutdown
+//!
+//! If the `Receiver` is simply dropped, then it is possible for there to be
+//! messages still in the channel that will not be processed. As such, it is
+//! usually desirable to perform a "clean" shutdown. To do this, the receiver
+//! will first call `close`, which will prevent any further messages to be sent
+//! into the channel. Then, the receiver consumes the channel to completion, at
+//! which point the receiver can be dropped.
 
 extern crate futures;
 
@@ -26,6 +45,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub use std::sync::mpsc::SendError;
 
+/// The transmission end of a channel which is used to send values.
+///
+/// This is created by the `channel` method.
 pub struct Sender<T> {
     // Channel state shared between the sender and receiver.
     inner: Arc<Inner<T>>,
@@ -42,6 +64,11 @@ pub struct Sender<T> {
     maybe_parked: Cell<bool>,
 }
 
+/// The receiving end of a channel which implements the `Stream` trait.
+///
+/// This is a concrete implementation of a stream which can be used to represent
+/// a stream of values being computed elsewhere. This is created by the
+/// `channel` method.
 pub struct Receiver<T> {
     inner: Arc<Inner<T>>,
 }
@@ -92,7 +119,19 @@ const MAX_BUFFER: usize = MAX_CAPACITY >> 1;
 // Sent to the consumer to wake up blocked producers
 type SenderTask = Arc<Mutex<Option<Task>>>;
 
-/// Create a new channel pair
+/// Creates an in-memory channel implementation of the `Stream` trait with
+/// bounded capacity.
+///
+/// This method creates a concrete implementation of the `Stream` trait which
+/// can be used to send values across threads in a streaming fashion. This
+/// channel is unique in that it implements back pressure to ensure that the
+/// sender never outpaces the receiver. The channel capacity is equal to
+/// `buffer + num-senders`. In other words, each sender gets a guaranteed slot
+/// in the channel capacity, and on top of that there are `buffer` "first come,
+/// first serve" slots available to all senders.
+///
+/// The `Receiver` returned implements the `Stream` trait and has access to any
+/// number of the associated combinators for transforming the result.
 pub fn channel<T>(buffer: usize) -> (Sender<T>, Receiver<T>) {
     // Check that the requested buffer size does not exceed the maximum buffer
     // size permitted by the system.
@@ -100,6 +139,18 @@ pub fn channel<T>(buffer: usize) -> (Sender<T>, Receiver<T>) {
     channel2(Some(buffer))
 }
 
+/// Creates an in-memory channel implementation of the `Stream` trait with
+/// unbounded capacity.
+///
+/// This method creates a concrete implementation of the `Stream` trait which
+/// can be used to send values across threads in a streaming fashion. A `send`
+/// on this channel will always succeed as long as the receive half has not
+/// been closed. If the receiver falls behind, messages will be buffered
+/// internally.
+///
+/// **Note** that the amount of available system memory is an implicit bound to
+/// the channel. Using an `unbounded` channel has the ability of causing the
+/// process to run out of memory. In this case, the process will be aborted.
 pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
     // usize::MAX is a special case where producers will never be blocked
     channel2(None)
@@ -135,11 +186,6 @@ fn channel2<T>(buffer: Option<usize>) -> (Sender<T>, Receiver<T>) {
  */
 
 impl<T> Sender<T> {
-    /// Try to return a new `Sender` handle.
-    ///
-    /// This function will succeed if doing so will not cause the total number
-    /// of outstanding senders to exceed the maximum that can be handled by the
-    /// system.
     fn try_clone(&self) -> Option<Sender<T>> {
         // Since this atomic op isn't actually guarding any memory and we don't
         // care about any orderings besides the ordering on the single atomic
@@ -170,19 +216,26 @@ impl<T> Sender<T> {
         }
     }
 
+    /// Returns `Async::Ready(())` if sending a message will succeed
+    ///
+    /// If `Async::NotReady` is returned, the current task will be notified
+    /// once the `Sender` becomes ready to accept a new value.
     pub fn poll_ready(&self) -> Async<()> {
         // First check the `maybe_parked` variable. This avoids acquiring the
         // lock in most cases
         if self.maybe_parked.get() {
             // Get a lock on the task handle
-            let task = self.sender_task.lock().unwrap();
+            let mut task = self.sender_task.lock().unwrap();
 
-            if task.is_some() {
-                Async::NotReady
-            } else {
+            if task.is_none() {
                 self.maybe_parked.set(false);
-                Async::Ready(())
+                return Async::Ready(());
             }
+
+            // Update the task in case the `Sender` has been moved to another
+            // task
+            *task = Some(task::park());
+            Async::NotReady
         } else {
             Async::Ready(())
         }
@@ -343,7 +396,7 @@ impl<T> Drop for Sender<T> {
  */
 
 impl<T> Receiver<T> {
-    /// Closes the receiving half.
+    /// Closes the receiving half
     ///
     /// This prevents any further messages from being sent on the channel while
     /// still enabling the receiver to drain messages that are buffered.

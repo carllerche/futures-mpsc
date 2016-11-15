@@ -5,6 +5,8 @@ use futures::*;
 
 use std::time::Duration;
 use std::thread;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn is_send<T: Send>() {}
 
@@ -196,6 +198,87 @@ fn stress_shared_bounded_hard() {
     drop(tx);
 
     t.join().ok().unwrap();
+}
+
+#[test]
+fn stress_receiver_multi_task_bounded_hard() {
+    const AMT: usize = 10_000;
+    const NTHREADS: u32 = 2;
+
+    let (mut tx, rx) = mpsc::channel::<usize>(0);
+    let rx = Arc::new(Mutex::new(Some(rx)));
+    let n = Arc::new(AtomicUsize::new(0));
+
+    let mut th = vec![];
+
+    for _ in 0..NTHREADS {
+        let rx = rx.clone();
+        let n = n.clone();
+
+        let t = thread::spawn(move || {
+            let mut i = 0;
+
+            loop {
+                i += 1;
+                let mut lock = rx.lock().ok().unwrap();
+
+                match lock.take() {
+                    Some(mut rx) => {
+                        if i % 5 == 0 {
+                            let (item, rest) = rx.into_future().wait().ok().unwrap();
+
+                            if item.is_none() {
+                                break;
+                            }
+
+                            n.fetch_add(1, Ordering::Relaxed);
+                            *lock = Some(rest);
+                        } else {
+                            // Just poll
+                            let n = n.clone();
+                            let r = lazy(move || {
+                                let r = match rx.poll().unwrap() {
+                                    Async::Ready(Some(_)) => {
+                                        n.fetch_add(1, Ordering::Relaxed);
+                                        *lock = Some(rx);
+                                        false
+                                    }
+                                    Async::Ready(None) => {
+                                        true
+                                    }
+                                    Async::NotReady => {
+                                        *lock = Some(rx);
+                                        false
+                                    }
+                                };
+
+                                Ok::<bool, ()>(r)
+                            }).wait().unwrap();
+
+                            if r {
+                                break;
+                            }
+                        }
+                    }
+                    None => break,
+                }
+            }
+        });
+
+        th.push(t);
+    }
+
+    for i in 0..AMT {
+        tx = tx.send(i).wait().unwrap();
+    }
+
+    drop(tx);
+
+    for t in th {
+        t.join().unwrap();
+    }
+
+    assert_eq!(AMT, n.load(Ordering::Relaxed));
 }
 
 fn is_ready<T>(res: &AsyncSink<T>) -> bool {

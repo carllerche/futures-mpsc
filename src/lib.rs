@@ -27,6 +27,46 @@
 //! into the channel. Then, the receiver consumes the channel to completion, at
 //! which point the receiver can be dropped.
 
+// At the core, the channel uses an atomic FIFO queue for message passing. This
+// queue is used as the primary coordination primitive. In order to enforce
+// capacity limits and handle back pressure, a secondary FIFO queue is used to
+// send parked task handles.
+//
+// The general idea is that the channel is created with a `buffer` size of `n`.
+// The channel capacity is `n + num-senders`. Each sender gets one "guaranteed"
+// slot to hold a message. This allows `Sender` to know for a fact that a send
+// will succeed *before* starting to do the actual work of sending the value.
+// Since most of this work is lock-free, once the work starts, it is impossible
+// to safely revert.
+//
+// If the sender is unable to process a send operation, then the the curren
+// task is parked and the handle is sent on the parked task queue.
+//
+// Note that the implementation guarantees that the channel capacity will never
+// exceed the configured limit, however there is no *strict* guarantee that the
+// receiver will wake up a parked task *immediately* when a slot becomes
+// available. However, it will almost always unpark a task when a slot becomes
+// available and it is *guaranteed* that a sender will be unparked when the
+// message that caused the sender to become parked is read out of the channel.
+//
+// The steps for sending a message are roughly:
+//
+// 1) Increment the channel message count
+// 2) If the channel is at capacity, push the task handle onto the wait queue
+// 3) Push the message onto the message queue.
+//
+// The steps for receiving a message are roughly:
+//
+// 1) Pop a message from the message queue
+// 2) Pop a task handle from the wait queue
+// 3) decreemnt the channel message count.
+//
+// It's important for the order of operations on lock-free structures to happen
+// in reverse order between the sender and receiver. This makes the message
+// queue the primary coordination structure and establishes the necessary
+// happens-before semantics required for the acquire / release semantics used
+// by the queue structure.
+
 extern crate futures;
 
 mod mpsc_queue;
@@ -71,25 +111,27 @@ pub struct Receiver<T> {
 }
 
 struct Inner<T> {
-    // Max buffer size of the channel
+    // Max buffer size of the channel. If `None` then the channel is unbounded.
     buffer: Option<usize>,
 
-    // Internal channel state
+    // Internal channel state. Consists of the number of messages stored in the
+    // channel as well as a flag signalling that the channel is closed.
     state: AtomicUsize,
 
-    // Message queue
+    // Atomic, FIFO queue used to send messages to the receiver
     message_queue: Queue<Option<T>>,
 
-    // Wait queue
-    wait_queue: Queue<SenderTask>,
+    // Atomic, FIFO queue used to send parked task handles to the receiver.
+    parked_queue: Queue<SenderTask>,
 
-    // Number of senders
+    // Number of senders in existence
     num_senders: AtomicUsize,
 
     // Handle to the receiver's task.
     recv_task: Mutex<Option<Task>>,
 }
 
+// Struct representation of `Inner::state`.
 #[derive(Debug, Clone, Copy)]
 struct State {
     // `true` when the channel is open
@@ -99,18 +141,25 @@ struct State {
     num_messages: usize,
 }
 
+// Returned from Receiver::try_park()
 enum TryPark {
     Parked,
     Closed,
     NotEmpty,
 }
 
+// The `is_open` flag is stored in the left-most bit of `Inner::state`
 const OPEN_MASK: usize = 1 << 31;
 
+// When a new channel is created, it is created in the open state with no
+// pending messages.
 const INIT_STATE: usize = OPEN_MASK;
 
+// The maximum number of messages that a channel can track is `usize::MAX > 1`
 const MAX_CAPACITY: usize = !(OPEN_MASK);
 
+// The maximum requested buffer size must be less than the maximum capacity of
+// a channel. This is because each sender gets a guaranteed slot.
 const MAX_BUFFER: usize = MAX_CAPACITY >> 1;
 
 // Sent to the consumer to wake up blocked producers
@@ -158,7 +207,7 @@ fn channel2<T>(buffer: Option<usize>) -> (Sender<T>, Receiver<T>) {
         buffer: buffer,
         state: AtomicUsize::new(INIT_STATE),
         message_queue: Queue::new(),
-        wait_queue: Queue::new(),
+        parked_queue: Queue::new(),
         num_senders: AtomicUsize::new(1),
         recv_task: Mutex::new(None),
     });
@@ -190,6 +239,7 @@ impl<T> Sender<T> {
         let mut curr = self.inner.num_senders.load(Ordering::Relaxed);
 
         loop {
+            // If the maximum number of senders has been reached, then fail
             if curr == self.inner.max_senders() {
                 return None;
             }
@@ -229,22 +279,28 @@ impl<T> Sender<T> {
                 return Async::Ready(());
             }
 
+            // At this point, an unpark request is pending, so there will be an
+            // unpark sometime in the future. We just need to make sure that
+            // the correct task will be notified.
+            //
             // Update the task in case the `Sender` has been moved to another
             // task
             *task = Some(task::park());
+
             Async::NotReady
         } else {
             Async::Ready(())
         }
     }
 
-    // Does the actual sending work
     fn start_send2(&mut self, msg: T) -> StartSend<T, SendError<T>> {
-        // If the sender is currently blocked, reject the message
+        // If the sender is currently blocked, reject the message before doing
+        // any work.
         if !self.poll_ready().is_ready() {
             return Ok(AsyncSink::NotReady(msg));
         }
 
+        // The channel has capacity to accept the message, so send it.
         try!(self.do_send(Some(msg), true));
 
         Ok(AsyncSink::Ready)
@@ -252,10 +308,24 @@ impl<T> Sender<T> {
 
     // Do the send without failing
     fn do_send(&mut self, msg: Option<T>, can_park: bool) -> Result<(), SendError<T>> {
+        // First, increment the number of messages contained by the channel.
+        // This operation will also atomically determine if the sender task
+        // should be parked and if the receiver task should be unparked.
+        //
+        // None is returned in the case that the channel has been closed by the
+        // receiver. This happens when `Receiver::close` is called or the
+        // receiver is dropped.
         let (park_self, unpark_recv) = match self.inc_num_messages(msg.is_none()) {
             Some((park_self, unpark_recv)) => (park_self, unpark_recv),
             None => {
-                // The receiver has closed the channel
+                // The receiver has closed the channel. Only abort if actually
+                // sending a message. It is important that the stream
+                // termination (None) is always sent. This technically means
+                // that it is possible for the queue to contain the following
+                // number of messages:
+                //
+                //     num-senders + buffer + 1
+                //
                 if let Some(msg) = msg {
                     return Err(SendError(msg));
                 } else {
@@ -264,13 +334,23 @@ impl<T> Sender<T> {
             }
         };
 
+        // If the channel has reached capacity, then the sender task needs to
+        // be parked. This will send the task handle on the parked task queue.
+        //
+        // However, when `do_send` is called while dropping the `Sender`,
+        // `task::park()` can't be called safely. In this case, in order to
+        // maintain internal consistency, a blank message is pushed onto the
+        // parked task queue.
         if park_self {
             self.park(can_park);
         }
 
-        // Push the message
+        // Push the message onto the message queue
         self.inner.message_queue.push(msg);
 
+        // If sending the message caused the number of messages contained by
+        // the channel to go from 0 -> 1, then the sender is responsible to
+        // unpark the receiver (if it is currently parked).
         if unpark_recv {
             // Do this step first so that the lock is dropped when
             // `unpark` is called
@@ -297,10 +377,14 @@ impl<T> Sender<T> {
                 return None;
             }
 
+            // This probably is never hit? Odds are the process will run out of
+            // memory first. It may be worth to return something else in this
+            // case?
             assert!(state.num_messages < MAX_CAPACITY, "buffer space exhausted; sending this messages would overflow the state");
 
             state.num_messages += 1;
 
+            // The channel is closed by all sender handles being dropped.
             if close {
                 state.is_open = false;
             }
@@ -309,7 +393,8 @@ impl<T> Sender<T> {
             let actual = self.inner.state.compare_and_swap(curr, next, Ordering::SeqCst);
 
             if curr == actual {
-                // Block if the current length is greater than the buffer
+                // Block if the current number of pending messages has exceeded
+                // the configured buffer size
                 let park_self = match self.inner.buffer {
                     Some(buffer) => state.num_messages > buffer,
                     None => false,
@@ -339,7 +424,7 @@ impl<T> Sender<T> {
 
         // Send handle over queue
         let t = self.sender_task.clone();
-        self.inner.wait_queue.push(t);
+        self.inner.parked_queue.push(t);
     }
 }
 
@@ -420,6 +505,7 @@ impl<T> Receiver<T> {
                     return Async::Ready(msg);
                 }
                 PopResult::Empty => {
+                    // The queue is empty, return NotReady
                     return Async::NotReady;
                 }
                 PopResult::Inconsistent => {
@@ -431,15 +517,19 @@ impl<T> Receiver<T> {
                     // 1) Spin
                     // 2) thread::yield_now()
                     // 3) task::park().unwrap() & return NotReady
+                    //
+                    // For now, thread::yield_now() is used, but it would
+                    // probably be better to spin a few times then yield.
                     thread::yield_now();
                 }
             }
         }
     }
 
+    // Unpark a single task handle if there is one pending in the parked queue
     fn unpark_one(&self) {
         loop {
-            match unsafe { self.inner.wait_queue.pop() } {
+            match unsafe { self.inner.parked_queue.pop() } {
                 PopResult::Data(task) => {
                     // Do this step first so that the lock is dropped when
                     // `unpark` is called
@@ -452,6 +542,7 @@ impl<T> Receiver<T> {
                     return;
                 }
                 PopResult::Empty => {
+                    // Queue empty, no task to wake up.
                     return;
                 }
                 PopResult::Inconsistent => {
@@ -462,23 +553,27 @@ impl<T> Receiver<T> {
         }
     }
 
+    // Try to park the receiver task
     fn try_park(&self) -> TryPark {
         let curr = self.inner.state.load(Ordering::SeqCst);
         let state = decode_state(curr);
 
+        // If there are pending messages, then there is no need to park.
         if state.num_messages > 0 {
             return TryPark::NotEmpty;
         }
 
+        // If the channel is closed, then there is no need to park.
         if !state.is_open {
             return TryPark::Closed;
         }
 
-        // First, track the task
+        // First, track the task in the `recv_task` slot
         let mut task = self.inner.recv_task.lock().unwrap();
         *task = Some(task::park());
 
-        // Ensure that there are still no messages
+        // Ensure that there are still no messages. It is possible for a
+        // message to have been sent while updating the task slot.
         let curr = self.inner.state.load(Ordering::SeqCst);
         let state = decode_state(curr);
 
@@ -490,8 +585,6 @@ impl<T> Receiver<T> {
     }
 
     fn dec_num_messages(&self) {
-        // No memory is being acquired as part of this step. Release is used to
-        // ensure that the queue reads happen before decrementing the counter.
         let mut curr = self.inner.state.load(Ordering::SeqCst);
 
         loop {
@@ -517,17 +610,27 @@ impl<T> Stream for Receiver<T> {
 
     fn poll(&mut self) -> Poll<Option<T>, ()> {
         loop {
+            // Try to read a message off of the message queue.
             let msg = match self.next_message() {
                 Async::Ready(msg) => msg,
                 Async::NotReady => {
+                    // There are no messages to read, in this case, attempt to
+                    // park. The act of parking will verify that the channel is
+                    // still empty after the park operation has completed.
                     match self.try_park() {
                         TryPark::Parked => {
+                            // The task was parked, and the channel is still
+                            // empty, return NotReady.
                             return Ok(Async::NotReady);
                         }
                         TryPark::Closed => {
+                            // The channel is closed, there will be no further
+                            // messages.
                             return Ok(Async::Ready(None));
                         }
                         TryPark::NotEmpty => {
+                            // A message was sent while trying to park. Yield
+                            // the thread and try the poll operation again.
                             thread::yield_now();
                             continue;
                         }
@@ -535,12 +638,14 @@ impl<T> Stream for Receiver<T> {
                 }
             };
 
-            // Unpark a send waiter
+            // If there are any parked task handles in the parked queue, pop
+            // one and unpark it.
             self.unpark_one();
 
             // Decrement number of messages
             self.dec_num_messages();
 
+            // Return the message
             return Ok(Async::Ready(msg));
         }
     }

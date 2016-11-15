@@ -39,7 +39,6 @@ use futures::sink::{Sink};
 use futures::stream::Stream;
 
 use std::{thread, usize};
-use std::cell::Cell;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -59,9 +58,7 @@ pub struct Sender<T> {
 
     // True if the sender might be blocked. This is an optimization to avoid
     // having to lock the mutex most of the time.
-    //
-    // This Cell also prevents the type from being `Sync`
-    maybe_parked: Cell<bool>,
+    maybe_parked: bool,
 }
 
 /// The receiving end of a channel which implements the `Stream` trait.
@@ -169,7 +166,7 @@ fn channel2<T>(buffer: Option<usize>) -> (Sender<T>, Receiver<T>) {
     let tx = Sender {
         inner: inner.clone(),
         sender_task: Arc::new(Mutex::new(None)),
-        maybe_parked: Cell::new(false),
+        maybe_parked: false,
     };
 
     let rx = Receiver {
@@ -208,7 +205,7 @@ impl<T> Sender<T> {
                 return Some(Sender {
                     inner: self.inner.clone(),
                     sender_task: Arc::new(Mutex::new(None)),
-                    maybe_parked: Cell::new(false),
+                    maybe_parked: false,
                 });
             }
 
@@ -220,15 +217,15 @@ impl<T> Sender<T> {
     ///
     /// If `Async::NotReady` is returned, the current task will be notified
     /// once the `Sender` becomes ready to accept a new value.
-    pub fn poll_ready(&self) -> Async<()> {
+    pub fn poll_ready(&mut self) -> Async<()> {
         // First check the `maybe_parked` variable. This avoids acquiring the
         // lock in most cases
-        if self.maybe_parked.get() {
+        if self.maybe_parked {
             // Get a lock on the task handle
             let mut task = self.sender_task.lock().unwrap();
 
             if task.is_none() {
-                self.maybe_parked.set(false);
+                self.maybe_parked = false;
                 return Async::Ready(());
             }
 
@@ -242,7 +239,7 @@ impl<T> Sender<T> {
     }
 
     // Does the actual sending work
-    fn start_send2(&self, msg: T) -> StartSend<T, SendError<T>> {
+    fn start_send2(&mut self, msg: T) -> StartSend<T, SendError<T>> {
         // If the sender is currently blocked, reject the message
         if !self.poll_ready().is_ready() {
             return Ok(AsyncSink::NotReady(msg));
@@ -254,7 +251,7 @@ impl<T> Sender<T> {
     }
 
     // Do the send without failing
-    fn do_send(&self, msg: Option<T>, can_park: bool) -> Result<(), SendError<T>> {
+    fn do_send(&mut self, msg: Option<T>, can_park: bool) -> Result<(), SendError<T>> {
         let (park_self, unpark_recv) = match self.inc_num_messages(msg.is_none()) {
             Some((park_self, unpark_recv)) => (park_self, unpark_recv),
             None => {
@@ -328,7 +325,7 @@ impl<T> Sender<T> {
         }
     }
 
-    fn park(&self, can_park: bool) {
+    fn park(&mut self, can_park: bool) {
         // TODO: clean up internal state if the task::park will fail
 
         let task = if can_park {
@@ -337,7 +334,7 @@ impl<T> Sender<T> {
             None
         };
 
-        self.maybe_parked.set(true);
+        self.maybe_parked = true;
         *self.sender_task.lock().unwrap() = task;
 
         // Send handle over queue
@@ -347,19 +344,6 @@ impl<T> Sender<T> {
 }
 
 impl<T> Sink for Sender<T> {
-    type SinkItem = T;
-    type SinkError = SendError<T>;
-
-    fn start_send(&mut self, msg: T) -> StartSend<T, SendError<T>> {
-        self.start_send2(msg)
-    }
-
-    fn poll_complete(&mut self) -> Poll<(), SendError<T>> {
-        Ok(Async::Ready(()))
-    }
-}
-
-impl<'a, T> Sink for &'a Sender<T> {
     type SinkItem = T;
     type SinkError = SendError<T>;
 

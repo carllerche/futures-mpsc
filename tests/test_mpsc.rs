@@ -1,7 +1,8 @@
 extern crate futures;
 extern crate futures_mpsc as mpsc;
 
-use futures::*;
+use futures::{Future, Stream, Sink, Async, AsyncSink};
+use futures::future::lazy;
 
 use std::time::Duration;
 use std::thread;
@@ -32,15 +33,12 @@ fn send_recv_no_buffer() {
 
     // Run on a task context
     lazy(move || {
-        assert!(tx.poll_ready().is_ready());
+        assert!(tx.poll_complete().unwrap().is_ready());
 
         // Send first message
 
         let res = tx.start_send(1).unwrap();
         assert!(is_ready(&res));
-
-        // assert!(!tx.poll_complete().is_ready());
-        assert!(!tx.poll_ready().is_ready());
 
         // Send second message
         let res = tx.start_send(2).unwrap();
@@ -48,9 +46,6 @@ fn send_recv_no_buffer() {
 
         // Take the value
         assert_eq!(rx.poll().unwrap(), Async::Ready(Some(1)));
-
-        // assert!(!tx.poll_complete().is_ready());
-        assert!(tx.poll_ready().is_ready());
 
         let res = tx.start_send(2).unwrap();
         assert!(is_ready(&res));

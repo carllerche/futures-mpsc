@@ -285,6 +285,11 @@ fn channel2<T>(buffer: Option<usize>) -> (Sender<T>, Receiver<T>) {
  */
 
 impl<T> Sender<T> {
+    /// Returns `Async::Ready` when sending a value will succeed
+    pub fn poll_ready(&mut self) -> Async<()> {
+        self.poll_unparked()
+    }
+
     // Do the send without failing
     fn do_send(&mut self, msg: Option<T>, can_park: bool) -> Result<(), SendError<T>> {
         // First, increment the number of messages contained by the channel.

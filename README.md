@@ -6,6 +6,10 @@ support.
 This crate is an exploration of features before they are merged into the
 [futures](https://github.com/alexcrichton/futures-rs/) crate.
 
+[![Crates.io](https://img.shields.io/crates/v/futures-mpsc.svg?maxAge=2592000)](https://crates.io/crates/futures-mpsc)
+
+[Documentation](https://docs.rs/futures-mpsc)
+
 ## Usage
 
 First, add this to your `Cargo.toml`:

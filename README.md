@@ -1,3 +1,5 @@
+**Deprecated in favor of [`futures::sync::mpsc`](https://docs.rs/futures/0.1.16/futures/sync/mpsc/index.html)!**
+
 # Future aware MPSC channel
 
 This crate provides a future aware, bounded, MPSC channel with back pressure
